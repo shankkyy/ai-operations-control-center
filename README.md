@@ -19,6 +19,7 @@ required.**
 See [docs/SYSTEM_ARCHITECTURE.md](docs/SYSTEM_ARCHITECTURE.md) for the full design,
 [docs/DECISIONS.md](docs/DECISIONS.md) for why things are built the way they are, and
 [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) for build/verification status.
+See [RENDER.md](RENDER.md) to deploy this to Render instead of running it locally.
 
 ## Quick start
 

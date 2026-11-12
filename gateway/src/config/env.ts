@@ -4,7 +4,9 @@ const schema = z.object({
   PORT: z.coerce.number().default(3000),
   DATABASE_URL: z.string(),
   REDIS_URL: z.string().default("redis://localhost:6379"),
-  AI_SERVICE_URL: z.string().default("http://localhost:8000"),
+  // Render's private-service address is host:port with no scheme; Docker Compose
+  // already supplies a full http:// URL, so this is a no-op there.
+  AI_SERVICE_URL: z.string().default("http://localhost:8000").transform((v) => (/^https?:\/\//.test(v) ? v : `http://${v}`)),
   JWT_SECRET: z.string().min(8),
   JWT_EXPIRES_IN: z.string().default("8h"),
   SEED_ADMIN_EMAIL: z.string().email().default("admin@aocc.local"),
