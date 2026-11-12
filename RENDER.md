@@ -1,117 +1,131 @@
-# Deploying to Render
+# Deploying to Render (free tier, manual — no Blueprint)
 
-`render.yaml` is Render's native Blueprint spec — it declares all 5 services
-(Postgres, Redis, ai-service, gateway, worker, frontend) in one file. No new
-Dockerfiles needed: Render's managed Postgres supports the `vector` extension
-directly, so unlike some other platforms there's no custom Postgres image to
-build — just a `CREATE EXTENSION` command (step 3 below).
+No `render.yaml`. On Render, only `web` services (and a time-limited free
+Postgres) have a free tier — `worker`, `keyvalue` (Redis), and `pserv`
+(private service) never do, Blueprint or not. To actually deploy for free,
+this uses **4 Render web services + 1 external free Redis**, which needed two
+small changes from the Docker Compose architecture:
+
+- **Redis is Upstash** (a separate free managed Redis), not a Render service.
+- **The BullMQ worker runs inside the gateway process** instead of as its own
+  service — set via `RUN_WORKER_INLINE=true`
+  (`gateway/src/index.ts`/`gateway/src/config/env.ts`). Defaults to `false`,
+  so `docker-compose.yml`'s separate `worker:` container is untouched for
+  local dev.
+- **ai-service is a public `web` service**, not a private one — see the
+  security trade-off in Gotchas below.
 
 Your repo is already on GitHub at `shankkyy/ai-operations-control-center`, so
-Render's Blueprint flow can read `render.yaml` straight from it.
+each Render service below can point straight at it.
 
-## 1. Deploy the blueprint
+## 1. Redis (Upstash, free)
 
-Render dashboard → New → Blueprint → connect this repo → Render parses
-`render.yaml` and shows all 5 resources with their plans for review *before*
-anything is created. This is also where you pick plan tiers — note that
-private services, background workers, and Key Value instances have no free
-tier on Render (only `web` services do), so check the cost preview before
-confirming.
+Sign up at [upstash.com](https://upstash.com), create a free Redis database,
+and copy its connection string (starts with `rediss://` — TLS; `ioredis`,
+which the gateway already uses, handles that scheme automatically, no code
+change needed).
 
-`SEED_ADMIN_PASSWORD` and `VITE_API_URL` are marked `sync: false` in the file
-(secrets/values Render won't auto-fill) — it'll prompt you for
-`SEED_ADMIN_PASSWORD` now; leave `VITE_API_URL` blank for the moment, you'll
-set it in step 5.
+## 2. Postgres
 
-Click **Apply** and wait for all 5 services to finish their first deploy.
+Render dashboard → New → PostgreSQL → name `aocc-postgres`, Free plan. Once
+created, copy its **Internal Database URL** (used by the two services below)
+— Render's free Postgres plan is time-limited and gets deleted after Render's
+current free-tier window, so check Render's pricing page if you want this to
+persist and upgrade if so.
 
-## 2. What got created
+### Enable pgvector + apply the schema (one-time)
 
-- **`aocc-postgres`** — managed Postgres, not reachable from outside Render by
-  default.
-- **`aocc-redis`** — a `keyvalue` (Render's current name for managed Redis)
-  instance; exposes `connectionString` to other services.
-- **`ai-service`** — a private service (`pserv`), reachable only from other
-  services in this environment, on `ai-service:8000`.
-- **`gateway`** — a public `web` service; gets a `https://gateway-<id>.onrender.com`
-  URL automatically.
-- **`aocc-worker`** — a `worker` (no HTTP, no public/private address) running
-  the same image as `gateway` with `dockerCommand: node dist/workers/index.js`
-  overriding the Dockerfile's `CMD` — this is `docker-compose.yml`'s `worker:`
-  entry.
-
-## 3. Enable pgvector + apply the schema (one-time)
-
-Open `aocc-postgres` in the Render dashboard → Connect → PSQL Command, run it
-locally (or use the dashboard's built-in shell), then:
-
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-```
-
-Then apply the schema itself (the same file Docker Compose applies via
-`db/init/sql/schema.sql`):
+From the Postgres page → Connect → PSQL Command, run it locally (or use the
+dashboard's shell), then:
 
 ```bash
-psql "$RENDER_POSTGRES_EXTERNAL_URL" -f db/init/sql/schema.sql
+psql "<external connection string>" -f db/init/sql/schema.sql
 ```
 
-(`db/init/sql/schema.sql` already starts with `CREATE EXTENSION IF NOT EXISTS
-vector;`, so the dashboard step above is redundant once you run this — it's
-there mainly so you can confirm pgvector is available before running anything
-else.)
+(`schema.sql` already starts with `CREATE EXTENSION IF NOT EXISTS vector;` —
+Render's managed Postgres supports pgvector natively, no custom image
+needed.)
 
-## 4. Seed demo data (one-time)
+## 3. ai-service
 
-Render's dashboard has a Shell tab per service. Open it on `gateway` and run:
+New → Web Service → connect the repo → Root Directory `ai-service` → Runtime:
+Docker (auto-detects `ai-service/Dockerfile`) → Instance Type: **Free**.
+
+Env vars:
+```
+DATABASE_URL=<Postgres Internal Database URL from step 2>
+PORT=8000
+LLM_PROVIDER=mock
+EMBEDDING_PROVIDER=mock
+```
+
+Deploy, then copy the generated URL (e.g. `https://ai-service-xxxx.onrender.com`)
+— you need it in step 4.
+
+## 4. gateway
+
+New → Web Service → Root Directory `gateway` → Docker → **Free**.
+
+Env vars:
+```
+DATABASE_URL=<Postgres Internal Database URL from step 2>
+REDIS_URL=<Upstash connection string from step 1>
+AI_SERVICE_URL=<ai-service's URL from step 3>
+RUN_WORKER_INLINE=true
+JWT_SECRET=<generate a real secret>
+JWT_EXPIRES_IN=8h
+SEED_ADMIN_EMAIL=admin@aocc.local
+SEED_ADMIN_PASSWORD=<pick one>
+```
+
+Deploy, then copy gateway's generated URL — you need it in step 5.
+
+## 5. frontend
+
+New → Web Service → Root Directory `frontend` → Docker → **Free**.
+
+Env vars:
+```
+PORT=5173
+VITE_API_URL=<gateway's URL from step 4>/api/v1
+```
+
+Vite inlines `VITE_API_URL` into the browser bundle at build time (same
+build-time-vs-runtime gotcha as `DECISIONS.md` #8 for Docker Compose), so this
+has to be gateway's actual URL, known only after step 4 — there's no way to
+express this ahead of time without a Blueprint's `fromService` reference.
+
+## 6. Seed demo data (one-time)
+
+Open the Shell tab on `gateway`'s dashboard page and run:
 
 ```bash
 node dist/scripts/seed.js
 ```
 
-This runs with `gateway`'s own environment (`DATABASE_URL`, `AI_SERVICE_URL`),
-so it needs no extra configuration.
+## 7. Verify
 
-## 5. Wire up the frontend's API URL
-
-Vite inlines `VITE_API_URL` into the browser bundle at build time (same
-build-time-vs-runtime gotcha noted in `DECISIONS.md` #8 for Docker Compose),
-and `render.yaml` can't predict `gateway`'s generated URL ahead of its first
-deploy — so this is the one step Render can't do declaratively:
-
-1. Copy `gateway`'s URL from its dashboard page, e.g.
-   `https://gateway-ab12.onrender.com`.
-2. On `frontend` → Environment, set `VITE_API_URL` to
-   `https://gateway-ab12.onrender.com/api/v1`.
-3. Manually redeploy `frontend` (Environment changes alone don't trigger a
-   rebuild for a Docker service's build-arg-consumed vars — use "Clear build
-   cache & deploy" to force Vite to actually re-inline it).
-
-## 6. Verify
-
-Open `frontend`'s URL, log in with `admin@aocc.local` / the
-`SEED_ADMIN_PASSWORD` you set in step 1, and check each service's Logs tab in
-the dashboard if anything 500s.
+Open `frontend`'s URL, log in with `admin@aocc.local` / your
+`SEED_ADMIN_PASSWORD`, and check each service's Logs tab if anything 500s.
 
 ## Gotchas
 
+- **Free web services spin down after 15 minutes idle** and cold-start
+  (~30-60s) on the next request. Since the worker now runs inside gateway's
+  process, a workflow approved while gateway is asleep sits queued until the
+  next HTTP request wakes gateway back up — not until then does it actually
+  run.
+- **ai-service is public**, not private, to qualify for the free tier —
+  anyone with its URL can call `/ingest`, `/rag/query`, etc. directly,
+  bypassing gateway's auth entirely. Harmless in mock mode (no secrets, no
+  paid API calls to leak); if you ever set a real `OPENAI_API_KEY` or
+  `ANTHROPIC_API_KEY`, treat that URL as sensitive, since nothing currently
+  stops someone else from burning your API budget through it.
 - Render detects which port a Docker service listens on by scanning, not by
-  reading the Dockerfile's `EXPOSE` — set an explicit `PORT` env var
-  (already done for `ai-service` and `frontend` in `render.yaml`) whenever the
-  container's hardcoded listen port isn't the Render default of `10000`.
-  `gateway` doesn't need one: it already reads `process.env.PORT` directly
-  (`gateway/src/config/env.ts`), so whatever Render injects just works.
-- `AI_SERVICE_URL` comes from `fromService`/`hostport`, which is `host:port`
-  with no scheme — `gateway/src/config/env.ts` now normalizes a scheme-less
-  value to `http://...` (a one-line change made for this; Docker Compose's
-  existing full-URL value passes through unchanged).
-- `render.yaml` can't concatenate two values into one env var (e.g. a
-  service's generated URL + a fixed path suffix), which is why step 5 is
-  manual rather than a `fromService` reference — Render *does* expose a
-  service's public URL via `fromService`/`envVarKey: RENDER_EXTERNAL_URL`, but
-  only as the bare origin, not with `/api/v1` appended.
-- Each service rebuilds independently on every push by default; Render's
-  per-service "Root Directory"/build filters aren't needed here since each
-  service already points at its own `dockerContext`, but a change to, say,
-  `frontend/` will still trigger Render to *check* all 5 services (cheaply) —
-  only the one whose context actually changed rebuilds.
+  reading the Dockerfile's `EXPOSE` — that's why `PORT` is set explicitly for
+  `ai-service` (8000) and `frontend` (5173) above. `gateway` doesn't need one:
+  it already reads `process.env.PORT` directly.
+- No `render.yaml`, so cross-service values (`DATABASE_URL`,
+  `AI_SERVICE_URL`, `REDIS_URL`) are copy-pasted between dashboard pages by
+  hand instead of auto-wired by `fromService`/`fromDatabase` references —
+  if you rotate a secret, you update it in every service that uses it.

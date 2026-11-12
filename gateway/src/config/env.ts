@@ -15,6 +15,10 @@ const schema = z.object({
   EMBEDDING_PROVIDER: z.string().default("mock"),
   OPENAI_API_KEY: z.string().default(""),
   ANTHROPIC_API_KEY: z.string().default(""),
+  // For single-process deploys (e.g. Render's free tier, which has no separate
+  // worker service): runs the BullMQ consumer inside the gateway process
+  // instead of docker-compose's dedicated `worker` container.
+  RUN_WORKER_INLINE: z.string().optional().transform((v) => v === "true"),
 });
 
 export const env = schema.parse(process.env);
